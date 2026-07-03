@@ -148,7 +148,7 @@ jobs:
 
       - name: Configure
         run: |
-            cmake -S . -B build --target install ${{ env.CMAKE_OPTS }}
+            cmake -S . --build ./build --target install ${{ env.CMAKE_OPTS }}
 
       - name: Build and run integration tests
         # run: cmake --build build ${{ env.CMAKE_BUILD_OPTS }} --target run-integration-tests
