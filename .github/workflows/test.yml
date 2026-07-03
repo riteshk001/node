@@ -8,7 +8,7 @@ on:
 
 env:
   CMAKE_BUILD_OPTS: --parallel 16
-  CMAKE_OPTS:  -Wno-dev -G=Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=${PREFIX}
+  CMAKE_OPTS:  -DCMAKE_INSTALL_PREFIX=/usr/bin/
 
 permissions:
   contents: read
