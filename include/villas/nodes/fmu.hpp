@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <ctime>
 #include <string>
 #include <vector>
@@ -22,10 +23,18 @@ namespace node {
 // Forward declarations
 struct Sample;
 
+enum FmuSignalSource { FmuSignalFromNode, FmuSignalFromNpy };
+
 struct FmuSignal {
   unsigned int ref = 0;
   fmi3_base_type_enu_t type = fmi3_base_type_enu_t::fmi3_base_type_float64;
   std::string name;
+
+  FmuSignalSource source = FmuSignalSource::FmuSignalFromNode;
+  std::string npy_path;
+  std::vector<size_t> dims;
+  size_t num_elem = 1;
+  size_t sample_offset = 0;
 };
 
 class FmuNode : public Node {
@@ -36,7 +45,8 @@ protected:
   int _read(struct Sample *smps[], unsigned cnt) override;
   int _write(struct Sample *smps[], unsigned cnt) override;
 
-  bool writing_turn;
+  bool writing_turn = true;
+  bool hasNodeInputs = false;
   const char *path;
   const char *unpackPath;
 
@@ -67,6 +77,11 @@ public:
 
 private:
   void parseSignal(json_t *json, bool in);
+  void resolveFmuVariable(FmuSignal &s);
+  void setFmuFromNpy(const FmuSignal &s);
+  void setFmuFromSample(const FmuSignal &s, const struct Sample *smp);
+  void writeToNpy(const FmuSignal &s);
+  size_t getFmuToSample(const FmuSignal &s, struct Sample *smp, size_t offset);
 
   double currentTime = 0;
   double step_size = 0.1;

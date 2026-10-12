@@ -205,7 +205,7 @@ endif()
 # Enable FMU node-type support
 if(WITH_NODE_FMU)
     list(APPEND NODE_SRC fmu.cpp)
-    list(APPEND LIBRARIES FMI)
+    list(APPEND LIBRARIES FMI -l:libcnpy.so)
 endif()
 
 add_library(nodes STATIC ${NODE_SRC})

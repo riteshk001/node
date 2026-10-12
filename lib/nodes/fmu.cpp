@@ -6,16 +6,24 @@
  */
 
 #include <cerrno>
+#include <cmath>
+#include <cstring>
 #include <cstddef>
+#include <memory>
+#include <string>
+#include <vector>
 
+#include <FMI3/fmi3_enums.h>
 #include <FMI3/fmi3_function_types.h>
+#include <FMI3/fmi3_import.h>
 #include <FMI3/fmi3_import_capi.h>
+#include <FMI3/fmi3_import_variable.h>
 #include <FMI3/fmi3_types.h>
 #include <JM/jm_callbacks.h>
 #include <JM/jm_types.h>
+#include <cnpy.h>
 #include <fmilib.h>
 #include <pthread.h>
-#include <stdio.h>
 #include <sys/stat.h>
 
 #include <villas/exceptions.hpp>
@@ -26,6 +34,51 @@
 
 using namespace villas;
 using namespace villas::node;
+
+
+double sampleValueAsDouble(const struct Sample *smp, size_t idx) {
+  if (!smp->signals)
+    return smp->data[idx].f;
+
+  auto sig = smp->signals->getByIndex(idx);
+  if (!sig)
+    return smp->data[idx].f;
+
+  switch (sig->type) {
+  case SignalType::FLOAT:
+    return smp->data[idx].f;
+  case SignalType::INTEGER:
+    return smp->data[idx].i;
+  case SignalType::BOOLEAN:
+    return smp->data[idx].b;
+  default:
+    return smp->data[idx].f;
+  }
+}
+
+void storeDoubleToSample(struct Sample *smp, size_t idx, double val) {
+  if (smp->signals) {
+    auto sig = smp->signals->getByIndex(idx);
+    if (sig) {
+      switch (sig->type) {
+      case SignalType::FLOAT:
+        smp->data[idx].f = val;
+        return;
+      case SignalType::INTEGER:
+        smp->data[idx].i = static_cast<int64_t>(val);
+        return;
+      case SignalType::BOOLEAN:
+        smp->data[idx].b = static_cast<bool>(val);
+        return;
+      default:
+        break;
+      }
+    }
+  }
+
+  smp->data[idx].f = val;
+}
+
 
 void FmuNode::loggerCallback(jm_callbacks *c, jm_string module,
                              jm_log_level_enu_t log_level, jm_string message) {
@@ -59,6 +112,252 @@ FmuNode::FmuNode(const uuid_t &id, const std::string &name)
   context = fmi_import_allocate_context(&callbacks);
 }
 
+void FmuNode::resolveFmuVariable(FmuSignal &s) {
+  auto *var = fmi3_import_get_variable_by_name(fmu, s.name.c_str());
+
+  if (!var)
+    throw RuntimeError("Invalid variable {}", s.name);
+
+  s.type = fmi3_import_get_variable_base_type(var);
+  s.ref = fmi3_import_get_variable_vr(var);
+  s.dims.clear();
+  s.num_elem = 1;
+
+  if (fmi3_import_variable_is_array(var)) {
+    auto *dim_list = fmi3_import_get_variable_dimension_list(var);
+    size_t n = fmi3_import_get_dimension_list_size(dim_list);
+    for (size_t i = 0; i < n; ++i) {
+      auto *dim = fmi3_import_get_dimension(dim_list, i);
+      if (!fmi3_import_get_dimension_has_start(dim)) {
+        throw RuntimeError("Runtime dimension not supported");
+      }
+      size_t ds = fmi3_import_get_dimension_start(dim);
+      s.dims.push_back(ds);
+      s.num_elem *= ds;
+    }
+  }
+}
+
+void FmuNode::setFmuFromNpy(const FmuSignal &s) {
+  if (s.npy_path.empty())
+    throw RuntimeError("FMU variable '{}' uses npy source but has no npy path",
+                       s.name);
+
+  cnpy::NpyArray arr = cnpy::npy_load(s.npy_path);
+  if (arr.num_vals != s.num_elem) {
+    throw RuntimeError(
+        "NPY '{}' has {} values, but FMU variable '{}' expects {}", s.npy_path,
+        arr.num_vals, s.name, s.num_elem);
+  }
+
+  fmi3_value_reference_t vr = s.ref;
+  fmi3_status_t status = fmi3_status_ok;
+  switch (s.type) {
+    using enum fmi3_base_type_enu_t;
+  case fmi3_base_type_float64:
+    status =
+        fmi3_import_set_float64(fmu, &vr, 1, arr.data<double>(), s.num_elem);
+    break;
+  case fmi3_base_type_float32:
+    status =
+        fmi3_import_set_float32(fmu, &vr, 1, arr.data<float>(), s.num_elem);
+    break;
+  case fmi3_base_type_int64:
+    status = fmi3_import_set_int64(fmu, &vr, 1, arr.data<fmi3_int64_t>(),
+                                   s.num_elem);
+    break;
+  case fmi3_base_type_int32:
+    status = fmi3_import_set_int32(fmu, &vr, 1, arr.data<fmi3_int32_t>(),
+                                   s.num_elem);
+    break;
+  case fmi3_base_type_bool:
+    status = fmi3_import_set_boolean(fmu, &vr, 1, arr.data<fmi3_boolean_t>(),
+                                     s.num_elem);
+    break;
+  default:
+    throw RuntimeError("Unsupported FMU type for npy input '{}'", s.name);
+  }
+
+  if (status == fmi3_status_error || status == fmi3_status_fatal)
+    throw RuntimeError("Failed to set FMU variable '{}' from npy '{}'", s.name,
+                       s.npy_path);
+}
+
+void FmuNode::setFmuFromSample(const FmuSignal &s, const struct Sample *smp) {
+  if (s.sample_offset + s.num_elem > smp->length) {
+    throw RuntimeError(
+        "Sample too short for FMU input '{}': need {} values from offset {}, "
+        "have length {}",
+        s.name, s.num_elem, s.sample_offset, smp->length);
+  }
+
+  fmi3_value_reference_t vr = s.ref;
+  fmi3_status_t status = fmi3_status_ok;
+  switch (s.type) {
+    using enum fmi3_base_type_enu_t;
+  case fmi3_base_type_float64: {
+    std::vector<fmi3_float64_t> buf(s.num_elem);
+    for (size_t i = 0; i < s.num_elem; ++i)
+      buf[i] = sampleValueAsDouble(smp, s.sample_offset + i);
+    status = fmi3_import_set_float64(fmu, &vr, 1, buf.data(), s.num_elem);
+    break;
+  }
+  case fmi3_base_type_float32: {
+    std::vector<fmi3_float32_t> buf(s.num_elem);
+    for (size_t i = 0; i < s.num_elem; ++i)
+      buf[i] = static_cast<fmi3_float32_t>(
+          sampleValueAsDouble(smp, s.sample_offset + i));
+    status = fmi3_import_set_float32(fmu, &vr, 1, buf.data(), s.num_elem);
+    break;
+  }
+  case fmi3_base_type_int64: {
+    std::vector<fmi3_int64_t> buf(s.num_elem);
+    for (size_t i = 0; i < s.num_elem; ++i)
+      buf[i] = static_cast<fmi3_int64_t>(
+          floor(sampleValueAsDouble(smp, s.sample_offset + i)));
+    status = fmi3_import_set_int64(fmu, &vr, 1, buf.data(), s.num_elem);
+    break;
+  }
+  case fmi3_base_type_int32: {
+    std::vector<fmi3_int32_t> buf(s.num_elem);
+    for (size_t i = 0; i < s.num_elem; ++i)
+      buf[i] = static_cast<fmi3_int32_t>(
+          floor(sampleValueAsDouble(smp, s.sample_offset + i)));
+    status = fmi3_import_set_int32(fmu, &vr, 1, buf.data(), s.num_elem);
+    break;
+  }
+  case fmi3_base_type_bool: {
+    // std::vector<fmi3_int8_t> buf(s.num_elem);
+    auto buf = std::make_unique<fmi3_boolean_t[]>(s.num_elem);
+    for (size_t i = 0; i < s.num_elem; ++i)
+      buf[i] = static_cast<fmi3_int8_t>(
+          sampleValueAsDouble(smp, s.sample_offset + i));
+    status = fmi3_import_set_boolean(fmu, &vr, 1, buf.get(), s.num_elem);
+    break;
+  }
+  default:
+    throw RuntimeError("Unsupported FMU type for node input '{}'", s.name);
+  }
+
+  if (status == fmi3_status_error || status == fmi3_status_fatal)
+    throw RuntimeError("Failed to set FMU variable '{}' from sample", s.name);
+}
+
+void FmuNode::writeToNpy(const FmuSignal &s) {
+  if (s.npy_path.empty())
+    throw RuntimeError("FMU variable '{}' uses npy source but has no npy path",
+                       s.name);
+
+  auto shape = s.dims.empty() ? std::vector<size_t>{1} : s.dims;
+  fmi3_value_reference_t vr = s.ref;
+  fmi3_status_t status = fmi3_status_ok;
+
+  switch (s.type) {
+    using enum fmi3_base_type_enu_t;
+  case fmi3_base_type_float64: {
+    std::vector<fmi3_float64_t> buf(s.num_elem);
+    status = fmi3_import_get_float64(fmu, &vr, 1, buf.data(), s.num_elem);
+    if (status != fmi3_status_error && status != fmi3_status_fatal)
+      cnpy::npy_save(s.npy_path, buf.data(), shape, "w");
+    break;
+  }
+  case fmi3_base_type_float32: {
+    std::vector<fmi3_float32_t> buf(s.num_elem);
+    status = fmi3_import_get_float32(fmu, &vr, 1, buf.data(), s.num_elem);
+    if (status != fmi3_status_error && status != fmi3_status_fatal)
+      cnpy::npy_save(s.npy_path, buf.data(), shape, "w");
+    break;
+  }
+  case fmi3_base_type_int64: {
+    std::vector<fmi3_int64_t> buf(s.num_elem);
+    status = fmi3_import_get_int64(fmu, &vr, 1, buf.data(), s.num_elem);
+    if (status != fmi3_status_error && status != fmi3_status_fatal)
+      cnpy::npy_save(s.npy_path, buf.data(), shape, "w");
+    break;
+  }
+  case fmi3_base_type_int32: {
+    std::vector<fmi3_int32_t> buf(s.num_elem);
+    status = fmi3_import_get_int32(fmu, &vr, 1, buf.data(), s.num_elem);
+    if (status != fmi3_status_error && status != fmi3_status_fatal)
+      cnpy::npy_save(s.npy_path, buf.data(), shape, "w");
+    break;
+  }
+  case fmi3_base_type_bool: {
+    // std::vector<fmi3_boolean_t> buf(s.num_elem);
+    auto buf = std::make_unique<fmi3_boolean_t[]>(s.num_elem);
+    status = fmi3_import_get_boolean(fmu, &vr, 1, buf.get(), s.num_elem);
+    if (status != fmi3_status_error && status != fmi3_status_fatal)
+      cnpy::npy_save(s.npy_path, buf.get(), shape, "w");
+    break;
+  }
+  default:
+    throw RuntimeError("Unsupported FMU type for npy output '{}'", s.name);
+  }
+
+  if (status == fmi3_status_error || status == fmi3_status_fatal)
+    throw RuntimeError("Failed to get FMU variable '{}' for npy '{}'", s.name,
+                       s.npy_path);
+}
+
+size_t FmuNode::getFmuToSample(const FmuSignal &s, struct Sample *smp,
+                               size_t offset) {
+  if (offset + s.num_elem > smp->capacity) {
+    throw RuntimeError(
+        "Sample capacity {} too small for FMU output '{}' ({} values at "
+        "offset {})",
+        smp->capacity, s.name, s.num_elem, offset);
+  }
+
+  fmi3_value_reference_t vr = s.ref;
+  fmi3_status_t status = fmi3_status_ok;
+  switch (s.type) {
+    using enum fmi3_base_type_enu_t;
+  case fmi3_base_type_float64: {
+    std::vector<fmi3_float64_t> buf(s.num_elem);
+    status = fmi3_import_get_float64(fmu, &vr, 1, buf.data(), s.num_elem);
+    for (size_t i = 0; i < s.num_elem; ++i)
+      storeDoubleToSample(smp, offset + i, buf[i]);
+    break;
+  }
+  case fmi3_base_type_float32: {
+    std::vector<fmi3_float32_t> buf(s.num_elem);
+    status = fmi3_import_get_float32(fmu, &vr, 1, buf.data(), s.num_elem);
+    for (size_t i = 0; i < s.num_elem; ++i)
+      storeDoubleToSample(smp, offset + i, buf[i]);
+    break;
+  }
+  case fmi3_base_type_int64: {
+    std::vector<fmi3_int64_t> buf(s.num_elem);
+    status = fmi3_import_get_int64(fmu, &vr, 1, buf.data(), s.num_elem);
+    for (size_t i = 0; i < s.num_elem; ++i)
+      storeDoubleToSample(smp, offset + i, static_cast<double>(buf[i]));
+    break;
+  }
+  case fmi3_base_type_int32: {
+    std::vector<fmi3_int32_t> buf(s.num_elem);
+    status = fmi3_import_get_int32(fmu, &vr, 1, buf.data(), s.num_elem);
+    for (size_t i = 0; i < s.num_elem; ++i)
+      storeDoubleToSample(smp, offset + i, static_cast<double>(buf[i]));
+    break;
+  }
+  case fmi3_base_type_bool: {
+    // std::vector<fmi3_boolean_t> buf(s.num_elem);
+    auto buf = std::make_unique<fmi3_boolean_t[]>(s.num_elem);
+    status = fmi3_import_get_boolean(fmu, &vr, 1, buf.get(), s.num_elem);
+    for (size_t i = 0; i < s.num_elem; ++i)
+      storeDoubleToSample(smp, offset + i, static_cast<double>(buf[i]));
+    break;
+  }
+  default:
+    throw RuntimeError("Unsupported FMU type for node output '{}'", s.name);
+  }
+
+  if (status == fmi3_status_error || status == fmi3_status_fatal)
+    throw RuntimeError("Failed to get FMU variable '{}' into sample", s.name);
+
+  return s.num_elem;
+}
+
 int FmuNode::prepare() {
   struct stat sb;
   // Check if path is valid
@@ -85,25 +384,43 @@ int FmuNode::prepare() {
     throw RuntimeError("Failed to load FMU binary");
   }
 
+  // Hardwiring resource path to test. To be removed later.
+  auto resource_path = std::string(unpackPath) + "/resources";
   if (fmi3_import_instantiate_co_simulation(
-          fmu, "instance1", unpackPath, fmi3_false, fmi3_true, fmi3_false,
+          fmu, "instance1", resource_path.c_str(), fmi3_false, fmi3_true, fmi3_false,
           fmi3_true, NULL, 0, NULL) != jm_status_success) {
     throw RuntimeError("Failed to instantiate FMU");
   }
 
   fmi3_import_enter_initialization_mode(fmu, fmi3_false, 0.0, start_time,
                                         stop_time_defined, stop_time);
+
+  // Resolve VR, type and dimensions, then apply npy inputs while still in init.
+  size_t in_offset = 0;
+  hasNodeInputs = false;
+  for (auto &sig : fmuSignalIn) {
+    resolveFmuVariable(sig);
+    if (sig.source == FmuSignalSource::FmuSignalFromNpy) {
+      setFmuFromNpy(sig);
+    } else {
+      sig.sample_offset = in_offset;
+      in_offset += sig.num_elem;
+      hasNodeInputs = true;
+    }
+  }
+
+  size_t out_offset = 0;
+  for (auto &sig : fmuSignalOut) {
+    resolveFmuVariable(sig);
+    if (sig.source == FmuSignalSource::FmuSignalFromNode) {
+      sig.sample_offset = out_offset;
+      out_offset += sig.num_elem;
+    }
+  }
+
   fmi3_import_exit_initialization_mode(fmu);
 
-  // Fetch ref and type of input and output FMU variables
-  for (size_t i = 0; i < fmuSignalIn.size(); i++) {
-    getValueReference(fmuSignalIn[i].name.data(), fmuSignalIn[i].ref,
-                      fmuSignalIn[i].type);
-  }
-  for (size_t i = 0; i < fmuSignalOut.size(); i++) {
-    getValueReference(fmuSignalOut[i].name.data(), fmuSignalOut[i].ref,
-                      fmuSignalOut[i].type);
-  }
+  writing_turn = hasNodeInputs;
 
   return Node::prepare();
 }
@@ -113,10 +430,9 @@ int FmuNode::check() { return Node::check(); }
 int FmuNode::_read(struct Sample *smps[], unsigned cnt) {
   assert(cnt == 1);
 
-  const bool hasInputs = !fmuSignalIn.empty();
   // Lock thread
   pthread_mutex_lock(&mutex);
-  while (hasInputs && (writing_turn || currentTime >= stop_time)) {
+  while (hasNodeInputs && (writing_turn || currentTime >= stop_time)) {
     pthread_cond_wait(&cv, &mutex);
   }
   double targetTime = currentTime + step_size;
@@ -163,60 +479,19 @@ int FmuNode::_read(struct Sample *smps[], unsigned cnt) {
 
   smps[0]->ts.origin = time_now();
   smps[0]->flags = (int)SampleFlags::HAS_DATA | (int)SampleFlags::HAS_TS_ORIGIN;
-  smps[0]->length = fmuSignalOut.size();
-  double val = 0;
-  for (size_t i = 0; i < fmuSignalOut.size(); i++) {
-    switch (fmuSignalOut[i].type) {
-      using enum fmi3_base_type_enu_t;
-    case fmi3_base_type_float64:
-      fmi3_import_get_float64(fmu, &fmuSignalOut[i].ref, 1, &val, 1);
-      break;
-    case fmi3_base_type_float32: {
-      float data = 0;
-      fmi3_import_get_float32(fmu, &fmuSignalOut[i].ref, 1, &data, 1);
-      val = data;
-      break;
-    }
-    case fmi3_base_type_int64: {
-      long data = 0;
-      fmi3_import_get_int64(fmu, &fmuSignalOut[i].ref, 1, &data, 1);
-      val = data;
-      break;
-    }
-    case fmi3_base_type_int32: {
-      int data = 0;
-      fmi3_import_get_int32(fmu, &fmuSignalOut[i].ref, 1, &data, 1);
-      val = data;
-      break;
-    }
-    case fmi3_base_type_bool: {
-      bool data = false;
-      fmi3_import_get_boolean(fmu, &fmuSignalOut[i].ref, 1, &data, 1);
-      val = data;
-      break;
-    }
-    default:
-      throw RuntimeError("Unsupported data type");
-      break;
-    }
-    auto sig = smps[0]->signals->getByIndex(i);
-    switch (sig->type) {
-    case villas::node::SignalType::FLOAT:
-      smps[0]->data[i].f = val;
-      break;
-    case villas::node::SignalType::INTEGER:
-      smps[0]->data[i].i = val;
-      break;
-    case villas::node::SignalType::BOOLEAN:
-      smps[0]->data[i].b = val;
-      break;
-    default:
-      break;
+
+  size_t sample_len = 0;
+  for (const auto &sig : fmuSignalOut) {
+    if (sig.source == FmuSignalSource::FmuSignalFromNpy) {
+      writeToNpy(sig);
+    } else {
+      sample_len += getFmuToSample(sig, smps[0], sig.sample_offset);
     }
   }
+  smps[0]->length = sample_len;
 
   // Unlock thread
-  if (hasInputs) {
+  if (hasNodeInputs) {
     writing_turn = true;
     pthread_cond_signal(&cv);
   }
@@ -228,59 +503,32 @@ int FmuNode::_read(struct Sample *smps[], unsigned cnt) {
 
 int FmuNode::_write(struct Sample *smps[], unsigned cnt) {
   assert(cnt == 1);
-  // Lock thread
-  if (fmuSignalOut.empty())
+
+  if (fmuSignalIn.empty())
     return 0;
+
+  // Npy-only inputs are applied during prepare(); refresh without turn sync.
+  if (!hasNodeInputs) {
+    for (const auto &sig : fmuSignalIn)
+      setFmuFromNpy(sig);
+    return 1;
+  }
+
+  // Lock thread
   pthread_mutex_lock(&mutex);
   while (!writing_turn) {
     pthread_cond_wait(&cv, &mutex);
   }
+
   ts = smps[0]->ts.origin;
-  for (size_t i = 0; i < fmuSignalIn.size(); i++) {
-    auto sig = smps[0]->signals->getByIndex(i);
-    double val = 0;
-    switch (sig->type) {
-    case villas::node::SignalType::FLOAT:
-      val = smps[0]->data[i].f;
-      break;
-    case villas::node::SignalType::INTEGER:
-      val = smps[0]->data[i].i;
-      break;
-    case villas::node::SignalType::BOOLEAN:
-      val = smps[0]->data[i].b;
-      break;
-    default:
-      break;
-    }
-    logger->debug("Input value {}", val);
-    switch (fmuSignalIn[i].type) {
-      using enum fmi3_base_type_enu_t;
-    case fmi3_base_type_float64:
-      fmi3_import_set_float64(fmu, &fmuSignalIn[i].ref, 1, &val, 1);
-      break;
-    case fmi3_base_type_float32: {
-      float data = val;
-      fmi3_import_set_float32(fmu, &fmuSignalIn[i].ref, 1, &data, 1);
-      break;
-    }
-    case fmi3_base_type_int64: {
-      long data = floor(val);
-      fmi3_import_set_int64(fmu, &fmuSignalIn[i].ref, 1, &data, 1);
-      break;
-    }
-    case fmi3_base_type_int32: {
-      int data = floor(val);
-      fmi3_import_set_int32(fmu, &fmuSignalIn[i].ref, 1, &data, 1);
-      break;
-    }
-    case fmi3_base_type_bool: {
-      bool data = val;
-      fmi3_import_set_boolean(fmu, &fmuSignalIn[i].ref, 1, &data, 1);
-      break;
-    }
-    default:
-      throw RuntimeError("Unsupported data type");
-      break;
+
+  for (const auto &sig : fmuSignalIn) {
+    if (sig.source == FmuSignalSource::FmuSignalFromNpy) {
+      setFmuFromNpy(sig);
+    } else {
+      setFmuFromSample(sig, smps[0]);
+      logger->debug("Set FMU input '{}' from sample ({} elements)", sig.name,
+                    sig.num_elem);
     }
   }
 
@@ -301,6 +549,58 @@ void FmuNode::getValueReference(const char *varName,
   }
   type = fmi3_import_get_variable_base_type(var);
   ref = fmi3_import_get_variable_vr(var);
+}
+
+void FmuNode::parseSignal(json_t *json, bool in) {
+  if (!json)
+    return;
+
+  if (!json_is_array(json))
+    throw ConfigError(json, "node-config-node-fmu-signals",
+                      "FMU signals must be an array");
+
+  size_t idx;
+  json_t *json_sig;
+  json_array_foreach(json, idx, json_sig) {
+    const char *name = nullptr;
+    const char *source_str = nullptr;
+    const char *npy = nullptr;
+    json_error_t err;
+
+    int ret = json_unpack_ex(json_sig, &err, 0, "{s:s, s?:s, s?:s}", "name",
+                             &name, "source", &source_str, "npy", &npy);
+    if (ret)
+      throw ConfigError(json_sig, err, "node-config-node-fmu-signal");
+
+    FmuSignal s;
+    s.name = name;
+
+    if (source_str) {
+      if (strcmp(source_str, "npy") == 0)
+        s.source = FmuSignalSource::FmuSignalFromNpy;
+      else if (strcmp(source_str, "node") == 0)
+        s.source = FmuSignalSource::FmuSignalFromNode;
+      else {
+        throw ConfigError(json_sig, "node-config-node-fmu-signal-source",
+                          "Invalid source '{}' for signal '{}' (use 'node' or "
+                          "'npy')",
+                          source_str, name);
+      }
+    }
+
+    if (npy)
+      s.npy_path = npy;
+
+    if (s.source == FmuSignalSource::FmuSignalFromNpy && s.npy_path.empty()) {
+      throw ConfigError(json_sig, "node-config-node-fmu-signal-npy",
+                        "Signal '{}' has source=npy but no 'npy' path", name);
+    }
+
+    if (in)
+      fmuSignalIn.push_back(s);
+    else
+      fmuSignalOut.push_back(s);
+  }
 }
 
 int FmuNode::parse(json_t *json) {
@@ -327,27 +627,24 @@ int FmuNode::parse(json_t *json) {
     stop_time_defined = true;
   }
 
-  if (in.signals) {
-    for (const auto &sig : *in.signals) {
-      FmuSignal s;
-      s.name = sig->name;
-      fmuSignalIn.push_back(s);
-    }
-  }
+  fmuSignalIn.clear();
+  fmuSignalOut.clear();
+  parseSignal(json_signals_in, true);
+  parseSignal(json_signals_out, false);
 
-  if (out.signals) {
-    for (const auto &sig : *out.signals) {
-      FmuSignal s;
-      s.name = sig->name;
-      fmuSignalOut.push_back(s);
-    }
-  }
-
-  // Swap in.signals and out.signals so that in.signals = FMU outputs and out.signals = FMU inputs.
+  // Swap in.signals and out.signals so that in.signals = FMU outputs and
+  // out.signals = FMU inputs.
   swapSignals();
 
-  // Initially set writing_turn to false if there are no input signals, _read() calls do_step() with default inputs.
-  writing_turn = !fmuSignalIn.empty();
+  // Wait for _write() only when at least one input comes from another node.
+  hasNodeInputs = false;
+  for (const auto &sig : fmuSignalIn) {
+    if (sig.source == FmuSignalSource::FmuSignalFromNode) {
+      hasNodeInputs = true;
+      break;
+    }
+  }
+  writing_turn = hasNodeInputs;
 
   return 0;
 }
