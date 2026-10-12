@@ -1,0 +1,56 @@
+{
+  "idle_stop": true,
+  "nodes": {
+    "fmu_node": {
+      "type": "fmu",
+      "fmu_path": "/workspaces/node/scratch_pad/fmu_temp/main_graph.fmu",
+      "fmu_unpack_path": "/workspaces/node/scratch_pad/fmu_temp/fmu_graph",
+      "start_time": 0.0,
+      "stop_time": 1.0,
+      "step_size": 1.0,
+      "in": {
+        "signals": [
+          {
+            "name": "load",
+            "source": "npy",
+            "npy": "/workspaces/node/scratch_pad/fmu_temp/input_data/load.npy"
+          },
+          {
+            "name": "transformer",
+            "source": "npy",
+            "npy": "/workspaces/node/scratch_pad/fmu_temp/input_data/transformer.npy"
+          },
+          {
+            "name": "load_phase_transformer",
+            "source": "npy",
+            "npy": "/workspaces/node/scratch_pad/fmu_temp/input_data/l2t.npy"
+          },
+          {
+            "name": "transformer_revphase_load",
+            "source": "npy",
+            "npy": "/workspaces/node/scratch_pad/fmu_temp/input_data/t2l.npy"
+          },
+          {
+            "name": "load_phase_transformer_label",
+            "source": "npy",
+            "npy": "/workspaces/node/scratch_pad/fmu_temp/input_data/label_edges.npy"
+          }
+        ]
+      },
+      "out": {
+        "signals": [
+          {
+            "name": "logits",
+            "source": "npy",
+            "npy": "/workspaces/node/scratch_pad/fmu_temp/output_logits.npy"
+          }
+        ]
+      }
+    }
+  },
+  "paths": [
+    {
+      "in": "fmu_node"
+    }
+  ]
+}

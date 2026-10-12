@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<fmiModelDescription
+  fmiVersion="3.0"
+  modelName="main_graph"
+  description="GNN based model for phase identification"
+  generationTool="ONNX2FMU"
+  instantiationToken="a7463883-3e91-4f47-8ebe-2a410a126aed"
+  generationDateAndTime="2026-08-23T13:58:30.502437">
+
+  <CoSimulation
+    modelIdentifier="main_graph"
+    canGetAndSetFMUState="true"
+    canSerializeFMUState="true"
+    canHandleVariableCommunicationStepSize="true"
+    providesIntermediateUpdate="true"
+    canReturnEarlyAfterIntermediateUpdate="true"
+    fixedInternalStepSize="1"/>
+
+  <LogCategories>
+    <Category name="logEvents" description="Log events"/>
+    <Category name="logStatusError" description="Log error messages"/>
+  </LogCategories>
+
+  <DefaultExperiment startTime="0" stopTime="1"/>
+
+  <ModelVariables>
+    <Float64 name="time" valueReference="0" causality="independent" variability="continuous" description="Simulation time"/>
+    <Float32
+        name="load"
+        valueReference="1"
+        causality="input"
+        variability="continuous"
+        description=""
+        start="1.0">
+      <Dimension start="55"/>
+      <Dimension start="1440"/>
+    </Float32>
+    <Float32
+        name="transformer"
+        valueReference="2"
+        causality="input"
+        variability="continuous"
+        description=""
+        start="1.0">
+      <Dimension start="3"/>
+      <Dimension start="1440"/>
+    </Float32>
+    <Int64
+        name="load_phase_transformer"
+        valueReference="3"
+        causality="input"
+        variability="continuous"
+        description=""
+        start="0">
+      <Dimension start="2"/>
+      <Dimension start="165"/>
+    </Int64>
+    <Int64
+        name="transformer_revphase_load"
+        valueReference="4"
+        causality="input"
+        variability="continuous"
+        description=""
+        start="0">
+      <Dimension start="2"/>
+      <Dimension start="165"/>
+    </Int64>
+    <Int64
+        name="load_phase_transformer_label"
+        valueReference="5"
+        causality="input"
+        variability="continuous"
+        description=""
+        start="0">
+      <Dimension start="2"/>
+      <Dimension start="165"/>
+    </Int64>
+    <Float32
+        name="logits"
+        valueReference="6"
+        causality="output"
+        variability="continuous"
+        description="">
+      <Dimension start="165"/>
+    </Float32>
+  </ModelVariables>
+
+  <ModelStructure>
+    <Output valueReference="6"/>
+    <InitialUnknown valueReference="6"/>
+  </ModelStructure>
+
+</fmiModelDescription>
